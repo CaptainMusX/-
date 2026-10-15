@@ -28,24 +28,22 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run AbleSci Sign
-        id: sign
+        # 签到失败时脚本以非零退出，本步骤和整个运行会显示为失败（GitHub 会发邮件提醒）
         run: |
-          python ablesci.py > output.log
-          LOG_CONTENT=$(cat output.log)
-          echo "LOG_CONTENT<<EOF" >> $GITHUB_ENV
-          echo "$LOG_CONTENT" >> $GITHUB_ENV
-          echo "EOF" >> $GITHUB_ENV
+          set -o pipefail
+          python ablesci.py 2>&1 | tee output.log
+          {
+            echo '### 科研通签到日志'
+            echo '```'
+            cat output.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
         env:
           GITHUB_ACTIONS: true
           ABLESCI_ACCOUNTS: ${{ secrets.ABLESCI_ACCOUNTS }}
-          # 选择一种通知服务
           # SCKEY: ${{ secrets.SCKEY }}          # Server酱
-          # XZKEY: ${{ secrets.XZKEY }}        # 息知 (按需启用)
+          # XZKEY: ${{ secrets.XZKEY }}          # 息知
           PUSH_PLUS_TOKEN: ${{ secrets.PUSH_PLUS_TOKEN }} # PushPlus (按需启用)
-
-      - name: Display Log
-        run: |
-          echo "$LOG_CONTENT"
 
   keepalive:
     # 防止仓库 60 天无提交后 GitHub 自动停用定时任务
