@@ -8,6 +8,7 @@ AbleSci自动签到脚本
 创建日期：2025年8月8日
 更新日期：2025年9月2日 >> 修复日志输出时间为北京时间 ; 修复签到前后用户信息显示 ; 优化登录失败处理 ; 优化签到已签到处理
 更新日期：2025年9月3日 >> 保护隐私，不在日志中显示完整邮箱和用户名
+更新日期：2026年10月15日 >> 适配科研通 2026-09 新版登录（meta CSRF + confirm-login）; 签到失败时以非零状态退出，Actions 会显示失败
 更新日期：2026年3月22日 >> 支持本地.env文件; 使用zoneinfo/pytz处理时区; 统一通知器; 修复zoneinfo时区查找失败问题,增加回退机制; 修复已签到处理逻辑; 
 作者：daitcl
 """
@@ -82,7 +83,7 @@ def load_env_file():
 
     if ENV_ACCOUNTS in os.environ:
         val = os.environ[ENV_ACCOUNTS]
-        print(f"当前 {ENV_ACCOUNTS} 内容预览: {val[:100]}{'...' if len(val) > 100 else ''}")
+        print(f"已读取 {ENV_ACCOUNTS}")
 
 load_env_file()
 
@@ -191,6 +192,8 @@ class AbleSciAuto:
         self.username = None
         self.points = None
         self.sign_days = None
+        self.csrf = ''
+        self.signed = False
         self.notifier = notifier if notifier else Notifier()
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
@@ -207,70 +210,95 @@ class AbleSciAuto:
         """代理日志到通知系统"""
         self.notifier.log(message, level)
         
-    def get_csrf_token(self):
+    def _meta_csrf(self, html):
+        """从页面 <meta name="csrf-token"> 读取令牌（2026-09-14 起科研通改为此方式）"""
+        soup = BeautifulSoup(html, 'html.parser')
+        meta = soup.find('meta', {'name': 'csrf-token'})
+        if meta and meta.get('content'):
+            return meta.get('content')
+        legacy = soup.find('input', {'name': '_csrf'})
+        if legacy and legacy.get('value'):
+            return legacy.get('value')
+        return ''
+
+    def get_csrf_token(self, url="https://www.ablesci.com/site/login"):
         """获取CSRF令牌"""
-        login_url = "https://www.ablesci.com/site/login"
         try:
-            response = self.session.get(login_url, headers=self.headers, timeout=30)
+            response = self.session.get(url, headers=self.headers, timeout=30)
             if response.status_code == 200:
-                soup = BeautifulSoup(response.text, 'html.parser')
-                csrf_token = soup.find('input', {'name': '_csrf'})
-                if csrf_token:
-                    return csrf_token.get('value', '')
-            else:
-                self.log(f"获取CSRF令牌失败，状态码: {response.status_code}", "error")
+                token = self._meta_csrf(response.text)
+                if token:
+                    self.csrf = token
+                return token
+            self.log(f"获取CSRF令牌失败，状态码: {response.status_code}", "error")
         except Exception as e:
             self.log(f"获取CSRF令牌时出错: {str(e)}", "error")
         return ''
 
+    def _post_headers(self, referer="https://www.ablesci.com/site/login"):
+        headers = self.headers.copy()
+        headers["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8"
+        headers["Referer"] = referer
+        headers["Origin"] = "https://www.ablesci.com"
+        headers["Accept"] = "application/json, text/javascript, */*; q=0.01"
+        return headers
+
     def login(self):
-        """执行登录操作"""
+        """执行登录操作（新版：密码登录 + confirm-login 二次确认）"""
         if not self.email or not self.password:
             self.log("邮箱或密码为空", "error")
             return False
-            
+
         login_url = "https://www.ablesci.com/site/login"
         csrf_token = self.get_csrf_token()
-        
         if not csrf_token:
             self.log("无法获取CSRF令牌", "error")
             return False
-        
+
         login_data = {
             "_csrf": csrf_token,
-            "email": self.email,
+            "email": self.email.strip().lower(),
             "password": self.password,
-            "remember": "off"
+            "remember": 1
         }
-        
-        headers = self.headers.copy()
-        headers["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8"
-        headers["Referer"] = "https://www.ablesci.com/site/login"
-        
         try:
-            response = self.session.post(
-                login_url,
-                data=login_data,
-                headers=headers,
-                timeout=30
-            )
-            
-            if response.status_code == 200:
-                try:
-                    result = response.json()
-                    if result.get("code") == 0:
-                        self.log(f"登录成功: {result.get('msg')}", "success")
-                        return True
-                    else:
-                        self.log(f"登录失败: {result.get('msg')}", "error")
-                except json.JSONDecodeError:
-                    if "退出" in response.text:
-                        self.log("登录成功", "success")
-                        return True
-                    else:
-                        self.log("登录失败: 无法解析响应", "error")
-            else:
+            response = self.session.post(login_url, data=login_data,
+                                         headers=self._post_headers(), timeout=30)
+            if response.status_code != 200:
                 self.log(f"登录请求失败，状态码: {response.status_code}", "error")
+                return False
+            try:
+                result = response.json()
+            except json.JSONDecodeError:
+                self.log("登录失败: 无法解析响应", "error")
+                return False
+
+            data = result.get("data") or {}
+            if result.get("code") != 0:
+                if data.get("verify"):
+                    self.log(f"登录失败: 网站要求图片验证码 ({result.get('msg')})", "error")
+                else:
+                    self.log(f"登录失败: {result.get('msg')}", "error")
+                return False
+
+            if data.get("csrf"):
+                self.csrf = data["csrf"]
+            token = data.get("confirm_token")
+            if token:
+                confirm_csrf = data.get("confirm_csrf") or self.csrf
+                confirm = self.session.post(
+                    "https://www.ablesci.com/site/confirm-login",
+                    data={"_csrf": confirm_csrf, "confirm_token": token},
+                    headers=self._post_headers(), timeout=30)
+                try:
+                    cres = confirm.json()
+                except Exception:
+                    cres = {}
+                if not (cres.get("code") == 0 and (cres.get("data") or {}).get("confirmed") is True):
+                    self.log(f"登录确认失败: HTTP {confirm.status_code} {cres.get('msg', '')}", "error")
+                    return False
+            self.log("登录成功", "success")
+            return True
         except Exception as e:
             self.log(f"登录过程中出错: {str(e)}", "error")
         return False
@@ -285,6 +313,9 @@ class AbleSciAuto:
             response = self.session.get(home_url, headers=headers, timeout=30)
             if response.status_code == 200:
                 soup = BeautifulSoup(response.text, 'html.parser')
+                token = self._meta_csrf(response.text)
+                if token:
+                    self.csrf = token
                 
                 # 用户名
                 username_element = soup.select_one('.mobile-hide.able-head-user-vip-username')
@@ -318,42 +349,51 @@ class AbleSciAuto:
             self.log(f"获取用户信息时出错: {str(e)}", "error")
         return False
 
+    def _handle_sign_result(self, result):
+        if result.get("code") == 0:
+            self.log(f"签到成功: {result.get('msg')}", "success")
+            data = result.get("data") or {}
+            if isinstance(data, dict):
+                if "points" in data:
+                    self.points = data["points"]
+                if "sign_days" in data:
+                    self.sign_days = data["sign_days"]
+            return True
+        msg = str(result.get('msg', ''))
+        if "已于" in msg or "已签到" in msg or "已经签到" in msg:
+            self.log(f"今日已签到: {msg}", "info")
+            return True
+        self.log(f"签到失败: {msg[:200]}", "error")
+        return None
+
     def sign_in(self):
-        """执行签到操作 - 处理已签到情况"""
+        """执行签到操作 - 先 GET，失败再带 CSRF 的 POST"""
         sign_url = "https://www.ablesci.com/user/sign"
         headers = self.headers.copy()
         headers["Referer"] = "https://www.ablesci.com/"
-        
+        headers["Accept"] = "application/json, text/javascript, */*; q=0.01"
         try:
             response = self.session.get(sign_url, headers=headers, timeout=30)
             if response.status_code == 200:
                 try:
-                    result = response.json()
-                    if result.get("code") == 0:
-                        msg = result.get("msg", "").replace("签到成功，", "", 1)
-                        self.log(f"签到成功: {result.get('msg')}", "success")
-                        
-                        data = result.get("data", {})
-                        if data:
-                            if "points" in data:
-                                self.points = data["points"]
-                                self.log(f"更新积分: {self.points}", "info")
-                            if "sign_days" in data:
-                                self.sign_days = data["sign_days"]
-                                self.log(f"更新连续签到天数: {self.sign_days}", "info")
+                    ok = self._handle_sign_result(response.json())
+                    if ok:
                         return True
-                    else:
-                        msg = result.get('msg', '')
-                        if "您今天已于" in msg:
-                            msg = result.get("msg", "").replace("签到失败，", "", 1)
-                            self.log(f"今日已签到: {msg}", "info")
-                            return True
-                        else:
-                            self.log(f"签到失败: {msg}", "error")
                 except json.JSONDecodeError:
-                    self.log("签到响应不是有效的JSON", "error")
+                    self.log("GET 签到响应不是JSON，改用 POST", "warning")
             else:
-                self.log(f"签到请求失败，状态码: {response.status_code}", "error")
+                self.log(f"GET 签到状态码 {response.status_code}，改用 POST", "warning")
+            if not self.csrf:
+                self.get_csrf_token("https://www.ablesci.com/")
+            response = self.session.post(sign_url, data={"_csrf": self.csrf},
+                                         headers=self._post_headers("https://www.ablesci.com/"), timeout=30)
+            if response.status_code == 200:
+                try:
+                    return bool(self._handle_sign_result(response.json()))
+                except json.JSONDecodeError:
+                    self.log("POST 签到响应不是有效的JSON", "error")
+            else:
+                self.log(f"POST 签到请求失败，状态码: {response.status_code}", "error")
         except Exception as e:
             self.log(f"签到过程中出错: {str(e)}", "error")
         return False
@@ -381,6 +421,7 @@ class AbleSciAuto:
             self.display_summary(is_before_sign=True)
             
             sign_result = self.sign_in()
+            self.signed = bool(sign_result)
             
             if sign_result:
                 self.log("签到完成，刷新用户信息...", "info")
@@ -397,7 +438,6 @@ def get_accounts():
         return []
     
     # 调试输出
-    print(f"原始账号环境变量内容: {repr(accounts_env)}")
     
     accounts = []
     # 支持换行符、分号、逗号分隔
@@ -425,7 +465,7 @@ def get_accounts():
         elif "|" in account:
             email, password = account.split("|", 1)
         else:
-            print(f"警告：跳过格式错误的账号项: {account}")
+            print("警告：跳过一个格式错误的账号项")
             continue
             
         email = email.strip()
@@ -433,7 +473,7 @@ def get_accounts():
         if email and password:
             valid_accounts.append((email, password))
         else:
-            print(f"警告：账号或密码为空: {email}:{password}")
+            print("警告：存在账号或密码为空的配置项")
     
     return valid_accounts
 
@@ -455,11 +495,14 @@ def main():
     
     global_notifier.log(f"找到 {account_count} 个账号", "info")
     
+    failed = 0
     for i, (email, password) in enumerate(accounts, 1):
         global_notifier.log(f"\n===== 开始处理第 {i}/{account_count} 个账号 =====", "info")
         
         automator = AbleSciAuto(email, password, notifier=global_notifier)
         automator.run()
+        if not automator.signed:
+            failed += 1
         
         global_notifier.log(f"===== 完成第 {i}/{account_count} 个账号处理 =====", "info")
     
@@ -468,8 +511,9 @@ def main():
     if global_notifier.notify_enabled:
         global_notifier.send_notification()
     
-    if os.getenv("GITHUB_ACTIONS") == "true":
-        print(f"::set-output name=log_content::{global_notifier.get_content()}")
+    if failed:
+        print(f"::error::{failed}/{account_count} 个账号签到失败，详见日志")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
