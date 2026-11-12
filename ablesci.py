@@ -14,12 +14,14 @@ AbleSci自动签到脚本
 """
 
 import os
+import re
 import sys
 import time
+import argparse
 import requests
-from bs4 import BeautifulSoup
 import json
 import datetime
+from html.parser import HTMLParser
 from pathlib import Path
 from datetime import timezone, timedelta
 
@@ -32,6 +34,71 @@ except ImportError:
 
 # 环境变量名常量
 ENV_ACCOUNTS = "ABLESCI_ACCOUNTS"
+
+# 邮箱匹配正则（用于识别账号锚点，避免按逗号/分号拆分时误伤密码）
+EMAIL_RE = re.compile(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}')
+
+VOID_TAGS = {
+    "area", "base", "br", "col", "embed", "hr", "img", "input",
+    "link", "meta", "param", "source", "track", "wbr",
+}
+
+
+class AbleSciHTMLParser(HTMLParser):
+    """用标准库提取 CSRF 令牌和用户信息，避免第三方 HTML 解析依赖。"""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.csrf = ""
+        self.username = ""
+        self.points = ""
+        self.sign_days = ""
+        self._depth = 0
+        self._captures = []
+        self._buffers = {"username": [], "points": [], "sign_days": []}
+
+    def _read_attrs(self, tag, attrs):
+        attrs = {key: (value or "") for key, value in attrs}
+        if tag == "meta" and attrs.get("name", "").lower() == "csrf-token":
+            self.csrf = attrs.get("content", "") or self.csrf
+        elif tag == "input" and attrs.get("name", "").lower() == "_csrf":
+            self.csrf = attrs.get("value", "") or self.csrf
+        return attrs
+
+    def handle_starttag(self, tag, attrs):
+        attrs = self._read_attrs(tag, attrs)
+        if tag in VOID_TAGS:
+            return
+
+        self._depth += 1
+        classes = attrs.get("class", "").split()
+        field = None
+        if "able-head-user-vip-username" in classes:
+            field = "username"
+        elif attrs.get("id") == "user-point-now":
+            field = "points"
+        elif attrs.get("id") == "sign-count":
+            field = "sign_days"
+
+        if field:
+            self._captures.append((field, self._depth))
+            self._buffers[field] = []
+
+    def handle_startendtag(self, tag, attrs):
+        self._read_attrs(tag, attrs)
+
+    def handle_endtag(self, tag):
+        if tag in VOID_TAGS:
+            return
+        if self._captures and self._captures[-1][1] == self._depth:
+            field, _ = self._captures.pop()
+            setattr(self, field, "".join(self._buffers[field]).strip())
+        self._depth = max(0, self._depth - 1)
+
+    def handle_data(self, data):
+        if self._captures:
+            self._buffers[self._captures[-1][0]].append(data)
+
 
 def load_env_file():
     """
@@ -82,7 +149,6 @@ def load_env_file():
         print(f"警告：存在无键账号行，但 {ENV_ACCOUNTS} 已通过系统或标准键值对设置，忽略无键行")
 
     if ENV_ACCOUNTS in os.environ:
-        val = os.environ[ENV_ACCOUNTS]
         print(f"已读取 {ENV_ACCOUNTS}")
 
 load_env_file()
@@ -173,7 +239,10 @@ class Notifier:
         content = "\n".join(self.log_content)
         
         try:
-            self.send(self.title, content)
+            result = self.send(self.title, content)
+            if result is False:
+                self.log("未配置任何通知方式，跳过通知发送", "warning")
+                return False
             self.log("通知发送成功", "success")
             return True
         except Exception as e:
@@ -210,16 +279,12 @@ class AbleSciAuto:
         """代理日志到通知系统"""
         self.notifier.log(message, level)
         
-    def _meta_csrf(self, html):
+    @staticmethod
+    def _meta_csrf(html):
         """从页面 <meta name="csrf-token"> 读取令牌（2026-09-14 起科研通改为此方式）"""
-        soup = BeautifulSoup(html, 'html.parser')
-        meta = soup.find('meta', {'name': 'csrf-token'})
-        if meta and meta.get('content'):
-            return meta.get('content')
-        legacy = soup.find('input', {'name': '_csrf'})
-        if legacy and legacy.get('value'):
-            return legacy.get('value')
-        return ''
+        parser = AbleSciHTMLParser()
+        parser.feed(html)
+        return parser.csrf
 
     def get_csrf_token(self, url="https://www.ablesci.com/site/login"):
         """获取CSRF令牌"""
@@ -295,13 +360,28 @@ class AbleSciAuto:
                 except Exception:
                     cres = {}
                 if not (cres.get("code") == 0 and (cres.get("data") or {}).get("confirmed") is True):
-                    self.log(f"登录确认失败: HTTP {confirm.status_code} {cres.get('msg', '')}", "error")
-                    return False
+                    if not self._session_is_authenticated():
+                        self.log(f"登录确认失败，且会话未建立: HTTP {confirm.status_code} {cres.get('msg', '')}", "error")
+                        return False
+                    self.log(f"登录确认接口返回异常，但会话已建立，继续: HTTP {confirm.status_code} {cres.get('msg', '')}", "warning")
             self.log("登录成功", "success")
             return True
         except Exception as e:
             self.log(f"登录过程中出错: {str(e)}", "error")
         return False
+
+    def _session_is_authenticated(self):
+        """确认二次登录失败后，检查是否其实已经拿到登录态。"""
+        try:
+            response = self.session.get("https://www.ablesci.com/", headers=self.headers, timeout=30)
+            if response.status_code != 200:
+                return False
+            html = response.text
+            return any(marker in html for marker in (
+                "able-head-user-vip-username", "user-point-now", "sign-count", "/site/logout"
+            ))
+        except Exception:
+            return False
 
     def get_user_info(self):
         """获取用户信息（包括用户名、积分和签到天数）"""
@@ -312,32 +392,29 @@ class AbleSciAuto:
         try:
             response = self.session.get(home_url, headers=headers, timeout=30)
             if response.status_code == 200:
-                soup = BeautifulSoup(response.text, 'html.parser')
-                token = self._meta_csrf(response.text)
-                if token:
-                    self.csrf = token
+                parser = AbleSciHTMLParser()
+                parser.feed(response.text)
+                if parser.csrf:
+                    self.csrf = parser.csrf
                 
                 # 用户名
-                username_element = soup.select_one('.mobile-hide.able-head-user-vip-username')
-                if username_element:
-                    self.username = username_element.text.strip()
+                if parser.username:
+                    self.username = parser.username
                     protected_username = protect_privacy(self.username)
                     self.log(f"用户名: {protected_username}", "info")
                 else:
                     self.log("无法定位用户名元素", "warning")
                 
                 # 积分
-                points_element = soup.select_one('#user-point-now')
-                if points_element:
-                    self.points = points_element.text.strip()
+                if parser.points:
+                    self.points = parser.points
                     self.log(f"当前积分: {self.points}", "info")
                 else:
                     self.log("无法获取积分信息", "warning")
                 
                 # 连续签到天数
-                sign_days_element = soup.select_one('#sign-count')
-                if sign_days_element:
-                    self.sign_days = sign_days_element.text.strip()
+                if parser.sign_days:
+                    self.sign_days = parser.sign_days
                     self.log(f"连续签到天数: {self.sign_days}", "info")
                 else:
                     self.log("无法获取连续签到天数", "warning")
@@ -432,53 +509,91 @@ class AbleSciAuto:
         return self.notifier.get_content()
 
 def get_accounts():
-    """从环境变量获取所有账号"""
+    """从环境变量获取所有账号
+
+    支持旧格式：
+    - 换行分隔多个账号
+    - 同一行用逗号或分号分隔多个账号
+    - 单个账号使用 邮箱:密码 或 邮箱|密码
+
+    解析时以“邮箱”为锚点，避免密码中的逗号/分号被误拆。
+    """
     accounts_env = os.getenv(ENV_ACCOUNTS)
     if not accounts_env:
         return []
-    
-    # 调试输出
-    
-    accounts = []
-    # 支持换行符、分号、逗号分隔
-    for line in accounts_env.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if ";" in line:
-            accounts.extend(line.split(";"))
-        elif "," in line:
-            accounts.extend(line.split(","))
-        else:
-            accounts.append(line)
-    
+
     valid_accounts = []
-    for account in accounts:
-        account = account.strip()
-        if not account:
+
+    for line_no, raw_line in enumerate(accounts_env.splitlines(), 1):
+        line = raw_line.strip()
+        if not line or line.startswith('#'):
             continue
-        # 支持邮箱和密码用冒号、分号或竖线分隔
-        if ":" in account:
-            email, password = account.split(":", 1)
-        elif ";" in account:
-            email, password = account.split(";", 1)
-        elif "|" in account:
-            email, password = account.split("|", 1)
-        else:
-            print("警告：跳过一个格式错误的账号项")
+
+        matches = list(EMAIL_RE.finditer(line))
+        if not matches:
+            print(f"警告：第 {line_no} 行未找到邮箱格式账号（内容已隐藏）")
             continue
-            
-        email = email.strip()
-        password = password.strip()
-        if email and password:
-            valid_accounts.append((email, password))
-        else:
-            print("警告：存在账号或密码为空的配置项")
-    
+
+        for i, match in enumerate(matches):
+            start = match.start()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(line)
+            segment = line[start:end].rstrip()
+
+            # 若后面还有下一个邮箱，说明末尾的 , 或 ; 是账号分隔符，去掉一个
+            if i + 1 < len(matches) and segment.endswith((',', ';')):
+                segment = segment[:-1].rstrip()
+
+            email = match.group(0)
+            rest = segment[len(email):]
+
+            if rest.startswith(':') or rest.startswith('|'):
+                password = rest[1:].strip()
+            else:
+                print(f"警告：第 {line_no} 行账号格式错误（内容已隐藏）")
+                continue
+
+            if password:
+                valid_accounts.append((email, password))
+            else:
+                print(f"警告：第 {line_no} 行密码为空（内容已隐藏）")
+
     return valid_accounts
+
+def check_site():
+    """只检查登录页、CSRF 令牌和账号配置，不执行登录/签到。"""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+    }
+    try:
+        response = requests.get("https://www.ablesci.com/site/login", headers=headers, timeout=30)
+    except Exception as exc:
+        print(f"检查失败：无法访问登录页：{exc}")
+        return 1
+
+    if response.status_code != 200:
+        print(f"检查失败：登录页 HTTP {response.status_code}")
+        return 1
+
+    token = AbleSciAuto._meta_csrf(response.text)
+    if not token:
+        print("检查失败：登录页可访问，但未找到 meta[csrf-token] 或 input[_csrf]")
+        return 1
+
+    accounts = get_accounts()
+    print("检查通过：登录页可访问，CSRF 令牌存在")
+    print(f"账号配置：{len(accounts)} 个（密码已隐藏）")
+    return 0
 
 def main():
     """主函数，处理多账号签到，统一通知器"""
+    parser = argparse.ArgumentParser(description="科研通自动签到")
+    parser.add_argument("--check", action="store_true", help="只检查登录页、CSRF 和账号配置，不执行签到")
+    args = parser.parse_args()
+
+    if args.check:
+        return check_site()
+
     # 创建全局通知器，所有账号共享
     global_notifier = Notifier("科研通多账号签到")
     global_notifier.log("科研通多账号签到任务开始", "info")
@@ -491,7 +606,7 @@ def main():
         global_notifier.log(f"请设置环境变量 {ENV_ACCOUNTS}，格式为：邮箱1:密码1[换行]邮箱2:密码2", "warning")
         if global_notifier.notify_enabled:
             global_notifier.send_notification()
-        return
+        return 1
     
     global_notifier.log(f"找到 {account_count} 个账号", "info")
     
@@ -513,7 +628,8 @@ def main():
     
     if failed:
         print(f"::error::{failed}/{account_count} 个账号签到失败，详见日志")
-        sys.exit(1)
+        return 1
+    return 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

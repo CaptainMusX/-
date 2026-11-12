@@ -7,11 +7,16 @@ on:
 
 permissions:
   contents: read
-  actions: write
+
+concurrency:
+  group: ablesci-sign
+  cancel-in-progress: false
 
 jobs:
   sign:
-    runs-on: ubuntu-latest
+    # 固定到 24.04，避免 ubuntu-latest 迁移到 26.04 时出现运行时变化
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -19,7 +24,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.12'
           cache: 'pip'
 
       - name: Install dependencies
@@ -30,27 +35,19 @@ jobs:
       - name: Run AbleSci Sign
         # 签到失败时脚本以非零退出，本步骤和整个运行会显示为失败（GitHub 会发邮件提醒）
         run: |
-          set -o pipefail
-          python ablesci.py 2>&1 | tee output.log
+          set +e
+          python -u ablesci.py 2>&1 | tee output.log
+          status=${PIPESTATUS[0]}
           {
             echo '### 科研通签到日志'
             echo '```'
             cat output.log
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
         env:
           GITHUB_ACTIONS: true
           ABLESCI_ACCOUNTS: ${{ secrets.ABLESCI_ACCOUNTS }}
           # SCKEY: ${{ secrets.SCKEY }}          # Server酱
           # XZKEY: ${{ secrets.XZKEY }}          # 息知
           PUSH_PLUS_TOKEN: ${{ secrets.PUSH_PLUS_TOKEN }} # PushPlus (按需启用)
-
-  keepalive:
-    # 防止仓库 60 天无提交后 GitHub 自动停用定时任务
-    runs-on: ubuntu-latest
-    if: always()
-    steps:
-      - name: Keep workflow enabled
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/ablesci-sign.yml/enable"

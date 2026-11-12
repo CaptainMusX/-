@@ -1,7 +1,7 @@
 # 科研通自动签到脚本
 
-![GitHub last commit](https://img.shields.io/github/last-commit/daitcl/ablesciSign)
-![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/daitcl/ablesciSign/ablesciSign.yml)
+![GitHub last commit](https://img.shields.io/github/last-commit/CaptainMusX/-)
+![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/CaptainMusX/-/ablesci-sign.yml)
 
 这是一个用于科研通(AbleSci)网站的自动签到脚本，支持青龙面板和GitHub Actions双平台运行。每日北京时间7点40,21点40，两个时间点自动签到。
 
@@ -31,6 +31,7 @@
     - 5.2 [如何接收通知？](#52-如何接收通知)
     - 5.3 [如何修改执行时间？](#53-如何修改执行时间)
     - 5.4 [可以配置多个账号吗？](#54-可以配置多个账号吗)
+    - 5.5 [GitHub Actions 被账单锁定时如何临时运行？](#55-github-actions-被账单锁定时如何临时运行)
 6. [许可证](#6-许可证)
 7. [微信公众号](#7-微信公众号)
 8. [赞赏](#8-赞赏)
@@ -85,7 +86,6 @@ user3@example.com:password3
 #### 2.1.3 安装依赖
 在青龙面板的依赖管理中添加以下依赖：
 - `requests`
-- `beautifulsoup4`
 
 ### 2.2 GitHub Actions 部署
 
@@ -117,7 +117,6 @@ user3@example.com:password3
 
 
 
-<<<<<<< HEAD
 ![添加Secrets](./img/image-20240926213937401.png)
 ![image-20250807033325755](./img/image-20250807033325755.png)
 
@@ -192,6 +191,7 @@ user3@example.com:password3
 - 请检查您的账号密码是否正确
 - 确保网络连接正常
 - 检查科研通网站是否有更新
+- 如果 Actions 日志在启动阶段就失败，并提示 `The job was not started because your account is locked due to a billing issue.`，这是 GitHub 账户级账单锁定，不是脚本错误。请到 `Settings → Billing and licensing → Payment information` 检查；如果页面提示账单信息因 government restrictions 不可用，需要通过 [GitHub Support](https://support.github.com/) 复核。锁定期间公共仓库的 Actions 也会被一起阻断。
 
 ### 5.2 如何接收通知？
 - **GitHub Actions**：
@@ -204,7 +204,7 @@ user3@example.com:password3
 
 ### 5.3 如何修改执行时间？
 - 青龙面板：在定时任务中修改 cron 表达式
-- GitHub Actions：在 `.github/workflows/ablesciSign.yml` 中修改 cron 表达式
+- GitHub Actions：在 `.github/workflows/ablesci-sign.yml` 中修改 cron 表达式
 
 ### 5.4 可以配置多个账号吗？
 是的，脚本支持多账号批量签到：
@@ -215,6 +215,33 @@ user3@example.com:password3
    - 设置 `ABLESCI_ACCOUNTS` Secret
    - 格式：`邮箱1:密码1[换行]邮箱2:密码2`
 3. 脚本会自动处理所有账号并发送汇总通知
+
+### 5.5 GitHub Actions 被账单锁定时如何临时运行？
+
+在账单问题解决前，可以在自己的电脑上运行同一份脚本：
+
+```powershell
+.\scripts\run_local.ps1
+```
+
+首次运行前，把 `.env.example` 复制为 `.env` 并填写账号（`.env` 已在 `.gitignore` 中忽略）：
+
+```dotenv
+ABLESCI_ACCOUNTS=user1@example.com:password1
+```
+
+也可以先只做连通性检查：
+
+```powershell
+python -m pip install -r requirements.txt
+python ablesci.py --check
+```
+
+Windows 上注册每天 07:40 和 21:40 的计划任务：
+
+```powershell
+.\scripts\install_windows_task.ps1
+```
 
 ---
 

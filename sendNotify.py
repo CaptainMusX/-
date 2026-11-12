@@ -60,7 +60,7 @@ def pushplus_bot(title, content):
         return
     
     print("PushPlus服务启动")
-    url = 'http://www.pushplus.plus/send'
+    url = 'https://www.pushplus.plus/send'
     data = {
         "token": PUSH_PLUS_TOKEN,
         "title": title,
@@ -87,19 +87,26 @@ def send(title, content):
     print(f"通知标题: {title}")
     print(f"通知内容:\n{content}")
     
+    configured = False
+
     # 依次尝试三种通知方式
     if SCKEY:
         serverJ(title, content)
+        configured = True
     
     if XZKEY:
         xizhi(title, content)
+        configured = True
     
     if PUSH_PLUS_TOKEN:
         pushplus_bot(title, content)
+        configured = True
     
     # 如果没有设置任何通知方式
-    if not SCKEY and not XZKEY and not PUSH_PLUS_TOKEN:
+    if not configured:
         print("未配置任何通知方式，跳过通知发送")
+        return False
+    return True
 
 if __name__ == '__main__':
     # 测试通知
